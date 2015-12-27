@@ -1,0 +1,133 @@
+---
+title: "Predicting Exercise Quality"
+author: "David E Kaufman"
+date: "December 24, 2015"
+output: html_document
+---
+```{r echo=F}
+rm(list=ls(all=TRUE))
+setwd("C:/Users/kaufman/Documents/Admin/Training/Coursera/Machine Learning/Course Project")
+```
+
+
+### Overview
+We want to predict how well a test subject is performing an activity from a collection of measurements taken by sensors the subject is wearing.  After data exploration and pre-processing, we find that predicting the data by a single tree is not very effective, but constructing a Random Forest (i.e., a voting method among many trees) is almost completely accurate.  The out-of-sample error is estimated to be 0.48%, and the accuracy on the test data (on which no model training was performed) is virtually 100%.
+
+### Data Acquisition, Input, and Exploration
+Data was acquired as
+```{r web, cache=TRUE, eval=FALSE}
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-training.csv", 
+              "pml-training.csv")
+download.file("https://d396qusza40orc.cloudfront.net/predmachlearn/pml-testing.csv", 
+              "pml-testing.csv")
+```
+
+An initial exploration discovered many of the 160 fields were clearly defective:
+```{r load, cache=TRUE}
+library(ggplot2)
+library(caret)
+set.seed(1301)
+data.train <- read.csv("pml-training.csv")
+outcomes <- data.train[[ncol(data.train)]]
+# Remove useless columns that "nzv" isn't going to get
+cols <- 1:ncol(data.train); M <- nrow(data.train)
+summary(data.train[,1:13])
+```
+For example, while `$pitch_belt` and `$yaw_belt` appear to be meaningful numeric data, `$kurtisos_roll_belt` and `$kurtosis_picth_belt` are mainly blank or defective (e.g., `#DIV/0!`) values.  Many of the 160 variables are defective in this fashion, so we identify and remove them as follows:
+```{r toss, dependson="load", cache=TRUE}
+goodval <- function(val) !(is.na(val) || val == '' || val == "NA" || grepl("DIV", val) )
+colcheck <- function(col) length(which(sapply(col, goodval)))
+colflag <- rep(0,length(cols))
+names(colflag) <- names(data.train)
+for(col in cols) {
+  vec <- data.train[,col]
+  if (colcheck(vec) > 0.9*M)
+    colflag[col] <- col
+}
+data.train.fix <- data.train[,colflag]
+(ncols <- length(names(data.train.fix)))
+c(dim(data.train), dim(data.train.fix))
+```
+This leaves 60 variables.  
+
+### Preprocessing to select a smaller data set still with high predictive value
+We will allow the caret package to reduce the data by eliminating variables that lack meaningful variation (`"nzv"`) and applying Principal Component Analysis to combine the numerical variables into a smaller linear combination that represents most of the same variation. 
+```{r shrink, dependson="toss", cache=TRUE}
+preProc1 <- preProcess(data.train.fix[-ncols], method=c("pca", "nzv", "center", "scale"))
+data.train.pp <- predict(preProc1, data.train.fix[-ncols])
+preProc1
+```
+Now we are down to only 30 variables on which we will try to predict:  the 27 from PCA and the 3 that PCA ignored.
+
+### Single-tree training
+Applying the method for a single classification tree:
+```{r tree, dependson="shrink", cache=TRUE}
+modFit1 <- train(data.train$classe ~ ., method="rpart", data=data.train.pp)
+modFit1$finalModel
+d.train.pred1 <- predict(modFit1, cbind(data.train.pp, outcomes))
+table(d.train.pred1, outcomes)
+confusionMatrix(d.train.pred1, outcomes)
+
+```
+The accuracy of this prediction tree is fairly poor at 49%.  Note in the Confusion Matrix that it's unable to predict any observations from the training set as yielding outcome "B", which is a large failure.
+
+### Random Forest prediction
+We now apply the Random Forest method for fitting a large number of trees from bootstrapped subsamples of the training data, allowing the trees to vote among themselves for a final predicted outcome on a given observation.
+
+Note the use of `randomForest()` from its own library rather than the `"rf"` option of the `train()` function in caret.  `train()` failed due to excessive RAM needs. 
+
+```{r, dependson="shrink"}
+options(warn=1)   #   Get immediate notification of problems, e.g., not enough memory available
+library(randomForest)
+```
+```{r rf1, dependson="shrink", cache=TRUE}
+(  modFit4 <- randomForest(outcomes ~ ., method="rf", data=data.train.pp)  )
+```
+Here we see a remarkably small estimated out-of-bag (OOB) error of about 0.4%, and a very high accuracy.  As a cross-check, we compute the outcomes that the Random Forest model predicts on the training set and their accuracy:
+```{r rf1x, dependson="rf1", dependson="shrink", cache=TRUE}
+d.train.pred4 <- predict(modFit4, cbind(data.train.pp, outcomes))
+table(d.train.pred4, outcomes)
+```
+The 100% accuracy shown here seems confusing, as it conflicts with the high but not perfect accuracy from the training run.  The difference is probably that the initial estimate is estimating from the imperfect accuracy of the various trees computed on the various bootstrap subsamples.
+
+With regard to the large memory needs and run time for large numbers of trees being built, let's experiment with forcing fewer trees (50, rather than the default of 500) to be built in the forest.
+```{r rf2, dependson="shrink", cache=TRUE}
+(  modFit5 <- randomForest(outcomes ~ ., method="rf", data=data.train.pp, ntree=50)  )
+```
+This ran much faster and achieved a result about equally good.
+
+### Prediction on the test sample
+```{r testdata, cache=TRUE}
+set.seed(1404)
+data.test <- read.csv("pml-testing.csv")
+outcomes.test <- data.test[[ncol(data.test)]]
+data.test.fix <- data.test[,colflag]
+data.test.pp <- predict(preProc1, data.test.fix[-ncols])
+for (i in 1:length(names(data.test.pp))) {
+  if(class(data.test.pp[,i])=="factor")
+    levels(data.test.pp[,i]) <- levels(data.train.pp[,i])
+} # to resolve a tricky error in predict();  see https://www.kaggle.com/c/15-071x-the-analytics-edge-competition-spring-2015/forums/t/13491/type-of-predictors-in-new-data-do-not-match-that-of-the-training-data
+
+(   answers <- d.test.pred4 <- predict(modFit4, 
+                                       newdata=cbind(data.test.pp, outcomes.test))   )
+```
+
+
+### Acknowledgements
+Data and descriptions from the experiments of this study have generously been made public by :
+Ugulino, W.; Cardador, D.; Vega, K.; Velloso, E.; Milidiu, R.; Fuks, H. Wearable Computing: Accelerometers' Data Classification of Body Postures and Movements. Proceedings of 21st Brazilian Symposium on Artificial Intelligence. Advances in Artificial Intelligence - SBIA 2012. In: Lecture Notes in Computer Science. , pp. 52-61. Curitiba, PR: Springer Berlin / Heidelberg, 2012. ISBN 978-3-642-34458-9. DOI: 10.1007/978-3-642-34459-6_6. 
+
+Read more: http://groupware.les.inf.puc-rio.br/har#ixzz3vYU4PoqU
+
+### Writing output files for uploading to grading process
+```{r, eval=FALSE}
+pml_write_files = function(x){
+  n = length(x)
+  for(i in 1:n){
+    filename = paste0("problem_id_",i,".txt")
+    write.table(x[i],file=filename,quote=FALSE,row.names=FALSE,col.names=FALSE)
+  }
+}
+setwd("C:/Users/kaufman/Documents/Admin/Training/Coursera/Machine Learning/Course Project/Output files")
+pml_write_files(as.vector(answers))
+```
